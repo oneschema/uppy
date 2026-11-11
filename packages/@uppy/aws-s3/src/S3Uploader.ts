@@ -15,6 +15,9 @@ const MIN_CHUNK_SIZE = 5 * MB
 /** Maximum number of parts allowed by S3 */
 const MAX_PARTS = 10000
 
+/** Number of parts of a single file uploaded concurrently */
+const PART_CONCURRENCY = 6
+
 // ============================================================================
 // S3Uploader Types
 // ============================================================================
@@ -291,44 +294,73 @@ export default class S3Uploader<M extends Meta, B extends Body> {
   }
 
   async #uploadRemainingParts(signal: AbortSignal): Promise<void> {
-    for (let i = 0; i < this.#chunks.length; i++) {
-      signal.throwIfAborted()
-      if (this.#chunkState[i].etag) continue // already uploaded
+    // Parts share one controller so a failed part, pause, or cancel stops the others.
+    const parts = new AbortController()
+    const abortParts = () => parts.abort(signal.reason)
+    signal.addEventListener('abort', abortParts, { once: true })
+    if (signal.aborted) abortParts()
 
-      const chunk = this.#chunks[i]
-      const partNumber = i + 1
-      const chunkData = this.#data.slice(chunk.start, chunk.end)
-      const chunkIndex = i // Capture for closure (cannot use for-loop variable i directly in a closure)
+    let nextChunk = 0
+    let firstError: unknown
+    const uploadNextParts = async () => {
+      try {
+        while (nextChunk < this.#chunks.length) {
+          parts.signal.throwIfAborted()
+          const chunkIndex = nextChunk++
+          if (this.#chunkState[chunkIndex].etag) continue // already uploaded
 
-      if (this.#resolvedKey == null) {
-        throw new Error('Missing S3 object key for uploading part')
-      }
-      const { etag } = await this.#options.s3Client.uploadPart({
-        key: this.#resolvedKey,
-        uploadId: this.#uploadId!,
-        data: chunkData,
-        partNumber,
-        onProgress: (bytesUploaded: number) => {
-          this.#chunkState[chunkIndex].uploaded = bytesUploaded
+          const chunk = this.#chunks[chunkIndex]
+          const partNumber = chunkIndex + 1
+          const chunkData = this.#data.slice(chunk.start, chunk.end)
+
+          if (this.#resolvedKey == null) {
+            throw new Error('Missing S3 object key for uploading part')
+          }
+          const { etag } = await this.#options.s3Client.uploadPart({
+            key: this.#resolvedKey,
+            uploadId: this.#uploadId!,
+            data: chunkData,
+            partNumber,
+            onProgress: (bytesUploaded: number) => {
+              if (parts.signal.aborted) return
+              this.#chunkState[chunkIndex].uploaded = bytesUploaded
+              this.#onProgress()
+            },
+            signal: parts.signal,
+          })
+          parts.signal.throwIfAborted()
+
+          // after part finished uploading, update chunk state
+          this.#chunkState[chunkIndex].uploaded = chunk.size
+          this.#chunkState[chunkIndex].etag = etag
           this.#onProgress()
-        },
-        signal,
-      })
 
-      // after part finished uploading, update chunk state
-      this.#chunkState[i].uploaded = chunk.size
-      this.#chunkState[i].etag = etag
-      this.#onProgress()
-
-      if (this.#options.onPartComplete) {
-        this.#options.onPartComplete({
-          PartNumber: partNumber,
-          ETag: etag,
-        })
+          if (this.#options.onPartComplete) {
+            this.#options.onPartComplete({
+              PartNumber: partNumber,
+              ETag: etag,
+            })
+          }
+        }
+      } catch (error) {
+        if (!parts.signal.aborted) {
+          firstError = error
+          parts.abort(error)
+        }
       }
     }
 
-    const parts = this.#chunkState.flatMap((state, i) =>
+    try {
+      await Promise.all(
+        Array.from({ length: PART_CONCURRENCY }, uploadNextParts),
+      )
+    } finally {
+      signal.removeEventListener('abort', abortParts)
+    }
+    if (firstError !== undefined) throw firstError
+    signal.throwIfAborted()
+
+    const completedParts = this.#chunkState.flatMap((state, i) =>
       state.etag ? [{ partNumber: i + 1, etag: state.etag }] : [],
     )
 
@@ -340,7 +372,7 @@ export default class S3Uploader<M extends Meta, B extends Body> {
       await this.#options.s3Client.completeMultipartUpload({
         key: this.#resolvedKey,
         uploadId: this.#uploadId!,
-        parts,
+        parts: completedParts,
         signal,
       })
 

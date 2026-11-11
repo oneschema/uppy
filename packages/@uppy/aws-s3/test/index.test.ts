@@ -968,3 +968,115 @@ describe('AwsS3', () => {
     })
   })
 })
+
+describe('multipart part concurrency', () => {
+  const PARTS = 8
+
+  function setup({
+    failPart,
+    listParts = [] as { partNumber: number; etag: string }[],
+  }: {
+    failPart?: number
+    listParts?: { partNumber: number; etag: string }[]
+  } = {}) {
+    const { signRequest } = createMultipartMocks()
+    let inFlight = 0
+    let maxInFlight = 0
+    const uploadedParts: number[] = []
+    let completeBody = ''
+    network.use(
+      http.post(s3Url, async ({ request }) => {
+        if (!new URL(request.url).searchParams.has('uploadId')) {
+          return new HttpResponse(
+            s3Responses.createMultipart('test-upload-id', 'test-key'),
+            { status: 200, headers: { 'Content-Type': 'application/xml' } },
+          )
+        }
+        completeBody = await request.text()
+        return new HttpResponse(
+          s3Responses.completeMultipart(
+            'https://test-bucket.s3.amazonaws.com/test-key',
+            'test-key',
+          ),
+          { status: 200, headers: { 'Content-Type': 'application/xml' } },
+        )
+      }),
+      http.put(s3Url, async ({ request }) => {
+        const partNumber = Number(
+          new URL(request.url).searchParams.get('partNumber'),
+        )
+        inFlight++
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        // Later parts finish first, so completion order differs from part order.
+        await new Promise((resolve) =>
+          setTimeout(resolve, (PARTS - partNumber) * 20),
+        )
+        inFlight--
+        if (partNumber === failPart) {
+          return new HttpResponse('', { status: 403 })
+        }
+        uploadedParts.push(partNumber)
+        return new HttpResponse('', {
+          status: 200,
+          headers: { ETag: `"etag-${partNumber}"` },
+        })
+      }),
+      http.get(
+        s3Url,
+        () =>
+          new HttpResponse(s3Responses.listParts(listParts), {
+            status: 200,
+            headers: { 'Content-Type': 'application/xml' },
+          }),
+      ),
+      http.delete(s3Url, () => new HttpResponse('', { status: 204 })),
+    )
+
+    const core = new Core().use(AwsS3, {
+      s3Endpoint: 'https://companion.example.com',
+      region: 'us-east-1',
+      signRequest,
+      shouldUseMultipart: true,
+    })
+    core.addFile({
+      source: 'test',
+      name: 'big.bin',
+      type: 'application/octet-stream',
+      data: new File([new Uint8Array(PARTS * 5 * MB)], 'big.bin'),
+    })
+    return {
+      core,
+      uploadedParts,
+      getMaxInFlight: () => maxInFlight,
+      getCompleteBody: () => completeBody,
+    }
+  }
+
+  test('uploads up to 6 parts of a file at once and completes in part order', async () => {
+    const { core, uploadedParts, getMaxInFlight, getCompleteBody } = setup()
+    using _ = core
+    const result = await core.upload()
+
+    expect(result?.successful).toHaveLength(1)
+    expect(getMaxInFlight()).toBe(6)
+    expect([...uploadedParts].sort((a, b) => a - b)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8,
+    ])
+    expect(uploadedParts).not.toEqual([...uploadedParts].sort((a, b) => a - b))
+    const completed = [
+      ...getCompleteBody().matchAll(/<PartNumber>(\d+)<\/PartNumber>/g),
+    ].map((m) => Number(m[1]))
+    expect(completed).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+  })
+
+  test('a failed part fails the upload and starts no further parts', async () => {
+    const { core, uploadedParts } = setup({ failPart: 6 })
+    using _ = core
+    const result = await core.upload()
+
+    expect(result?.failed).toHaveLength(1)
+    expect(result?.successful).toHaveLength(0)
+    // Part 6 fails first, which aborts parts 1-5 and keeps 7 and 8 from starting.
+    expect(uploadedParts).toEqual([])
+  })
+})
