@@ -982,6 +982,11 @@ describe('multipart part concurrency', () => {
     const { signRequest } = createMultipartMocks()
     let inFlight = 0
     let maxInFlight = 0
+    const startedParts: number[] = []
+    let releaseFirstParts!: () => void
+    const firstPartsReleased = new Promise<void>((resolve) => {
+      releaseFirstParts = resolve
+    })
     const uploadedParts: number[] = []
     let completeBody = ''
     network.use(
@@ -1005,8 +1010,12 @@ describe('multipart part concurrency', () => {
         const partNumber = Number(
           new URL(request.url).searchParams.get('partNumber'),
         )
+        startedParts.push(partNumber)
         inFlight++
         maxInFlight = Math.max(maxInFlight, inFlight)
+        // Hold the first parts until 6 are in flight, so timing can't serialize them.
+        if (startedParts.length >= 6) releaseFirstParts()
+        await firstPartsReleased
         // Later parts finish first, so completion order differs from part order.
         await new Promise((resolve) =>
           setTimeout(resolve, (PARTS - partNumber) * 20),
@@ -1046,6 +1055,7 @@ describe('multipart part concurrency', () => {
     })
     return {
       core,
+      startedParts,
       uploadedParts,
       getMaxInFlight: () => maxInFlight,
       getCompleteBody: () => completeBody,
@@ -1070,13 +1080,13 @@ describe('multipart part concurrency', () => {
   })
 
   test('a failed part fails the upload and starts no further parts', async () => {
-    const { core, uploadedParts } = setup({ failPart: 6 })
+    const { core, startedParts } = setup({ failPart: 6 })
     using _ = core
     const result = await core.upload()
 
     expect(result?.failed).toHaveLength(1)
     expect(result?.successful).toHaveLength(0)
     // Part 6 fails first, which aborts parts 1-5 and keeps 7 and 8 from starting.
-    expect(uploadedParts).toEqual([])
+    expect([...startedParts].sort()).toEqual([1, 2, 3, 4, 5, 6])
   })
 })
